@@ -34,10 +34,17 @@ int gfx_initialize(const void *webp, size_t len) {
     return 1;
   }
 
+  size_t heapl = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+  ESP_LOGI(TAG, "Allocating buffer of %u on heap of %u", len, heapl);
+
   // Initialize state
   _state = calloc(1, sizeof(struct gfx_state));
   _state->len = len;
   _state->buf = calloc(1, len);
+  if (_state->buf == NULL) {
+    ESP_LOGE("gfx", "Memory allocation failed!");
+    return 1;
+  }
   memcpy(_state->buf, webp, len);
 
   _state->mutex = xSemaphoreCreateMutex();
@@ -75,11 +82,20 @@ int gfx_update(const void *webp, size_t len) {
     return 1;
   }
 
-  // Update state
+  // Update state buffer safely if needed
   if (len > _state->len) {
+    void *new_buf = malloc(len);
+    if (!new_buf) {
+      ESP_LOGE(TAG, "gfx_update: malloc(%u) failed, keeping old buffer", len);
+      // release mutex and bail
+      xSemaphoreGive(_state->mutex);
+      return 1;
+    }
+    // Free only after allocation
     free(_state->buf);
-    _state->buf = malloc(len);
+    _state->buf = new_buf;
   }
+
   memcpy(_state->buf, webp, len);
   _state->len = len;
   _state->counter++;
@@ -111,13 +127,32 @@ static void gfx_loop(void *arg) {
 
     // If there's new data, copy it to local buffer
     if (counter != _state->counter) {
-      if (_state->len > len) {
+      size_t new_len = _state->len;
+      // Only re-allocate if the new blob is larger
+      // Free before allocate!
+      // if (_state->len > len) {
+      //   free(webp);
+      //   webp = malloc(_state->len);
+      // }
+      if (new_len > len) {
+        uint8_t *new_buf = malloc(new_len);
+        if (!new_buf) {
+          ESP_LOGE(TAG, "gfx_loop: malloc(%u) failed, keeping old buffer",
+                   new_len);
+          // Release mutex, skip copy and move on after a bit
+          xSemaphoreGive(_state->mutex);
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+        // allocation succeeded — toss the old buffer
         free(webp);
-        webp = malloc(_state->len);
+        webp = new_buf;
       }
-      len = _state->len;
+
+      // Copy
+      len = new_len;
       counter = _state->counter;
-      memcpy(webp, _state->buf, _state->len);
+      memcpy(webp, _state->buf, new_len);
     }
 
     // Give mutex
@@ -129,8 +164,15 @@ static void gfx_loop(void *arg) {
     // Draw it
     if (draw_webp(webp, len)) {
       ESP_LOGE(TAG, "Could not draw webp");
+      vTaskDelay(pdMS_TO_TICKS(1 * 1000));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));  // Don't be greedy
     }
   }
+
+  // Clean up if we ever break out
+  free(webp);
+  vTaskDelete(NULL);
 }
 
 static int draw_webp(uint8_t *buf, size_t len) {
@@ -146,7 +188,7 @@ static int draw_webp(uint8_t *buf, size_t len) {
 
   WebPAnimDecoder *decoder = WebPAnimDecoderNew(&webpData, &decoderOptions);
   if (decoder == NULL) {
-    ESP_LOGE(TAG, "Could not create WebP decoder");
+    ESP_LOGE(TAG, "Could not create WebP decoder: %u", len);
     return 1;
   }
 
@@ -165,16 +207,14 @@ static int draw_webp(uint8_t *buf, size_t len) {
     uint8_t *pix;
     int timestamp;
     WebPAnimDecoderGetNext(decoder, &pix, &timestamp);
-    if (delay > 0)
-      xTaskDelayUntil(&drawStartTick, pdMS_TO_TICKS(delay));
+    if (delay > 0) xTaskDelayUntil(&drawStartTick, pdMS_TO_TICKS(delay));
     drawStartTick = xTaskGetTickCount();
     display_draw(pix, animation.canvas_width, animation.canvas_height, 4, 0, 1,
                  2);
     delay = timestamp - lastTimestamp;
     lastTimestamp = timestamp;
   }
-  if (delay > 0)
-    xTaskDelayUntil(&drawStartTick, pdMS_TO_TICKS(delay));
+  if (delay > 0) xTaskDelayUntil(&drawStartTick, pdMS_TO_TICKS(delay));
 
   // In case of a single frame, sleep for 1s
   if (animation.frame_count == 1) {
