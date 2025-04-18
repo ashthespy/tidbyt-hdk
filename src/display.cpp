@@ -2,89 +2,45 @@
 
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include "driver/gpio.h"
+#include <esp_log.h>
+#include "pinsmap.h"
 
-#ifdef TIDBYT_GEN2
-#define R1 5
-#define G1 23
-#define BL1 4
-#define R2 2
-#define G2 22
-#define BL2 32
 
-#define CH_A 25
-#define CH_B 21
-#define CH_C 26
-#define CH_D 19
-#define CH_E -1  // assign to pin 14 if using more than two panels
-
-#define LAT 18
-#define OE 27
-#define CLK 15
-#elif defined(TIXEL)
-#pragma message "Compiling for TIXEL board pins"
-#define LED_MATRIX_MOSFET GPIO_NUM_4
-#define R1 22
-#define G1 32
-#define BL1 21
-#define R2 19
-#define G2 33
-#define BL2 17
-
-#define CH_A 16
-#define CH_B 25
-#define CH_C 27
-#define CH_D 26
-#define CH_E -1
-
-#define LAT 14
-#define OE 13
-#define CLK 12
-#elif defined(ESPS3)
-#pragma message "Compiling for ESPS3 board pins"
-// #define LED_MATRIX_MOSFET GPIO_NUM_4
-#define R1 4          // R1_PIN_DEFAULT -> R1
-#define G1 5          // G1_PIN_DEFAULT -> G1
-#define BL1 6         // B1_PIN_DEFAULT -> BL1
-#define R2 7          // R2_PIN_DEFAULT -> R2
-#define G2 15         // G2_PIN_DEFAULT -> G2
-#define BL2 16        // B2_PIN_DEFAULT -> BL2 (Note: You had 17, but default is 16)
-
-#define CH_A 18       // A_PIN_DEFAULT -> CH_A
-#define CH_B 8        // B_PIN_DEFAULT -> CH_B
-#define CH_C 3        // C_PIN_DEFAULT -> CH_C
-#define CH_D 42       // D_PIN_DEFAULT -> CH_D
-#define CH_E -1       // E_PIN_DEFAULT -> CH_E (kept as -1 since it's required for 1/32 panels)
-
-#define LAT 40        // LAT_PIN_DEFAULT -> LAT
-#define OE 2          // OE_PIN_DEFAULT -> OE
-#define CLK 41        // CLK_PIN_DEFAULT -> CLK
-#else
-#define R1 21
-#define G1 2
-#define BL1 22
-#define R2 23
-#define G2 4
-#define BL2 27
-
-#define CH_A 26
-#define CH_B 5
-#define CH_C 25
-#define CH_D 18
-#define CH_E -1  // assign to pin 14 if using more than two panels
-
-#define LAT 19
-#define OE 32
-#define CLK 33
-#endif
 
 static MatrixPanel_I2S_DMA *_matrix;
+static const char* TAG = "display";
+static uint8_t _brightness = DISPLAY_DEFAULT_BRIGHTNESS;
+static uint8_t _dsplay_night_state = 0; // Defaults to on.
+static uint8_t _dsplay_state = 1; // Defaults to on.
+
+
+// Helper function to toggle the display by toggling the LED matrix MOSFET
+void toggle_display_night_mode() {  
+  uint8_t new_level = !_dsplay_night_state;
+  gpio_set_level(LED_MATRIX_MOSFET, new_level);  
+  ESP_LOGI(TAG, "Display night mode toggled %d --> %d", _dsplay_night_state, new_level);  
+  _dsplay_night_state = new_level;
+}
+
+void toggle_display() {  
+  if (_dsplay_state == 1){
+    ESP_LOGI(TAG, "Display toggled %d --> %d", _dsplay_state, 0);
+    display_shutdown();
+
+  } else  {
+    display_initialize();
+  }
+  _dsplay_state = ! _dsplay_state;
+}
+
 
 int display_initialize() {
   // Check if we need to power on the panel first
   #ifdef TIXEL   
-    gpio_reset_pin(LED_MATRIX_MOSFET);
-    gpio_set_direction(LED_MATRIX_MOSFET, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_MATRIX_MOSFET, 1);
+    // gpio_reset_pin(LED_MATRIX_MOSFET);
+    // gpio_set_direction(LED_MATRIX_MOSFET, GPIO_MODE_OUTPUT);
+    // gpio_set_level(LED_MATRIX_MOSFET, 1);
+    toggle_display_night_mode();
     HUB75_I2S_CFG::shift_driver driver = HUB75_I2S_CFG::SHIFTREG; // HUB75_I2S_CFG::SHIFTREG;
     #elif defined(ESPS3)
     HUB75_I2S_CFG::shift_driver driver = HUB75_I2S_CFG::SHIFTREG;
@@ -117,7 +73,9 @@ int display_initialize() {
   _matrix = new MatrixPanel_I2S_DMA(mxconfig);
 
   // Set brightness and clear the screen.
-  _matrix->setBrightness8(DISPLAY_DEFAULT_BRIGHTNESS);
+  // _matrix->setBrightness8(DISPLAY_DEFAULT_BRIGHTNESS);
+  display_set_brightness(DISPLAY_DEFAULT_BRIGHTNESS);
+  _matrix->clearScreen();
   if (!_matrix->begin()) {
     return 1;
   }
@@ -126,9 +84,32 @@ int display_initialize() {
   return 0;
 }
 
+void display_start() {
+  #ifdef TIXEL
+  gpio_set_level(LED_MATRIX_MOSFET, 1);
+  #endif
+  _matrix->clearScreen();
+  _matrix->stopDMAoutput();
+}
+
 void display_shutdown() {
   display_clear();
   _matrix->stopDMAoutput();
+  #ifdef TIXEL
+  gpio_set_level(LED_MATRIX_MOSFET, 0);
+  #endif
+}
+
+void display_set_brightness(uint8_t b) {
+  if (b != _brightness) {
+    ESP_LOGI(TAG, "Setting brightness to %d", b);
+    _brightness = b;
+    _matrix->setBrightness8(b);
+    // _matrix->clearScreen();
+  }
+}
+uint8_t get_brightness() {
+  return  _brightness;
 }
 
 void display_draw(const uint8_t *pix, int width, int height,
