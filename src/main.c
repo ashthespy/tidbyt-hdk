@@ -6,10 +6,12 @@
 #include <webp/demux.h>
 
 #include "audio.h"
+#include "build_info.h"  // generated
 #include "display.h"
 #include "driver/gpio.h"
 #include "flash.h"
 #include "gfx.h"
+#include "ota_server.h"
 #include "pinsmap.h"
 #include "remote.h"
 #include "sdkconfig.h"
@@ -99,6 +101,9 @@ void app_main(void) {
 #ifdef TIXEL
   setupGPIOS();
 #endif
+
+  ESP_LOGI(TAG, "Fw: %s", BUILD_VERSION);
+  ESP_LOGI(TAG, "Built: %s", BUILD_TIMESTAMP);
   // Setup the device flash storage.
   if (flash_initialize()) {
     ESP_LOGE(TAG, "failed to initialize flash");
@@ -119,6 +124,10 @@ void app_main(void) {
     return;
   }
   esp_register_shutdown_handler(&wifi_shutdown);
+
+  if (start_ota_server()) {
+    ESP_LOGE(TAG, "failed to initialize OTA");
+  }
 
   // Setup audio.
   if (audio_initialize() != ESP_OK) {
