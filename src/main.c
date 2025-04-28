@@ -15,10 +15,17 @@
 #include "pinsmap.h"
 #include "remote.h"
 #include "sdkconfig.h"
+#include "time_sync.h"
 #include "touch.h"
+#include "util.h"
 #include "wifi.h"
 
 static const char* TAG = "main";
+#define MIN_FETCH_INTERVAL 2  // Don't hammer the server.
+
+#ifndef DEFAULT_TIMEZONE
+DEFAULT_TIMEZONE = "America/New_York"
+#ifdef
 
 #ifdef TIXEL
 // Polls button states and calls functions for display toggle and brightness
@@ -155,6 +162,8 @@ void app_main(void) {
     ESP_LOGI(TAG, "WiFi MAC: %02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1],
              mac[2], mac[3], mac[4], mac[5]);
   }
+
+  time_start_sync_task(DEFAULT_TIMEZONE);
 
   // Play a sample. This will only have an effect on Gen 2 devices.
   audio_play(ASSET_LAZY_DADDY_MP3, ASSET_LAZY_DADDY_MP3_LEN);
