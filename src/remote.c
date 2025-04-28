@@ -7,6 +7,8 @@
 #include <esp_system.h>
 #include <esp_tls.h>
 
+#include "util.h"
+
 static const char* TAG = "remote";
 
 struct remote_state {
@@ -16,6 +18,7 @@ struct remote_state {
   size_t max;
   uint8_t brightness;
   uint8_t dwell_secs;
+  uint8_t palette_mode;
   esp_err_t err;
 };
 
@@ -26,9 +29,6 @@ struct remote_state {
 #ifndef HTTP_BUFFER_SIZE_DEFAULT
 #define HTTP_BUFFER_SIZE_DEFAULT 32 * 1024
 #endif
-
-#define MAX(a, b) (((a) > (b)) ? (a) : (b))
-#define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
 static esp_err_t _httpCallback(esp_http_client_event_t* event) {
   struct remote_state* state = (struct remote_state*)event->user_data;
@@ -53,15 +53,18 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
       ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", event->header_key,
                event->header_value);
       // Failsafe if we can't fit on memory
+      // size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+      // size_t content_length = strtoul(event->header_value, NULL, 10);
+      // if (content_length > free_heap - SAFETY_MARGIN) {
       if (strcmp(event->header_key, "Content-Length") == 0) {
         size_t content_length = (size_t)atoi(event->header_value);
         if (content_length > state->max) {
           ESP_LOGE(TAG,
                    "Content-Length (%zu bytes) exceeds allowed max (%zu bytes)",
                    content_length, state->max);
-          state->err = ESP_ERR_NO_MEM;
           free(state->buf);
           state->buf = NULL;
+          state->err = ESP_ERR_NO_MEM;
           state->size = 0;
           state->len = 0;
           // esp_http_client_close(event->client);  // Abort the HTTP request
@@ -69,16 +72,37 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
         } else {
           ESP_LOGI(TAG, "Content-Length Header:%zu bytes", content_length);
         }
+        // re-allocate a single time, we know our buffer size..
+        free(state->buf);
+        state->buf = malloc(content_length);
+        if (state->buf == NULL) {
+          ESP_LOGE(TAG, "Failed malloc(%zu) for Content-Length",
+                   content_length);
+          state->size = 0;
+          state->len = 0;
+          state->err = ESP_ERR_NO_MEM;
+          esp_http_client_close(event->client);
+          return state->err;
+        }
+        state->size = content_length;
+        ESP_LOGI(TAG, "Resized buffer to Content-Length: %zu bytes",
+                 content_length);
       }
 
-      // Check for our Brightness and Dwell headers
+      // Check for our Tronbyt-* Headers
       if (strcmp(event->header_key, "Tronbyt-Brightness") == 0) {
-        state->brightness = (uint8_t)atoi(event->header_value);
-        ESP_LOGI(TAG, "Tronbyt-Brightness: %s --> %d", event->header_value,
+        int brightness_pct = atoi(event->header_value);
+        state->brightness = (uint8_t)(MIN(MAX(brightness_pct, 0), 100));
+        ESP_LOGI(TAG, "Brightness: %s%% --> %d%%", event->header_value,
                  state->brightness);
       } else if (strcmp(event->header_key, "Tronbyt-Dwell-Secs") == 0) {
-        state->dwell_secs = (int)atoi(event->header_value);
-        // ESP_LOGI(TAG, "Tronbyt-Dwell-Secs value: %i", dwell_secs_value);
+        state->dwell_secs = (uint8_t)atoi(event->header_value);
+        ESP_LOGI(TAG, "Dwell-Secs: %d", state->dwell_secs);
+      } else if (strcmp(event->header_key, "Tronbyt-Palette") == 0) {
+        state->palette_mode = (uint8_t)atoi(event->header_value);
+        ESP_LOGI(TAG, "Palette: %d", state->palette_mode);
+      } else {
+        ESP_LOGD(TAG, "Unhandled Header: %s", event->header_key);
       }
       break;
 
@@ -88,42 +112,10 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
 
     case HTTP_EVENT_ON_DATA:
       ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", event->data_len);
-
-      if (event->user_data == NULL || state->err != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "Discarding HTTP response due to missing state or error: %s",
-                 esp_err_to_name(state->err));
+      if (state->buf == NULL || state->err != ESP_OK) {
         break;
       }
-
-      struct remote_state* state = (struct remote_state*)event->user_data;
-
-      // If needed, resize the buffer to fit the new data
-      if (event->data_len + state->len > state->size) {
-        // Determine new size
-        state->size =
-            MAX(MIN(state->size * 2, state->max), state->len + event->data_len);
-        if (state->size > state->max) {
-          ESP_LOGE(TAG, "Response size exceeds allowed max (%d bytes)",
-                   state->max);
-          free(state->buf);
-          state->err = ESP_ERR_NO_MEM;
-          break;
-        }
-
-        // And reallocate
-        void* new = realloc(state->buf, state->size);
-        if (new == NULL) {
-          ESP_LOGE(TAG, "Resizing response buffer failed");
-          free(state->buf);
-          state->err = ESP_ERR_NO_MEM;
-          break;
-        }
-        state->buf = new;
-      }
-
-      // Copy over the new data
-      memcpy(state->buf + state->len, event->data, event->data_len);
+      memcpy((uint8_t*)state->buf + state->len, event->data, event->data_len);
       state->len += event->data_len;
       break;
 
@@ -147,7 +139,9 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
   return state->err;
 }
 
-int remote_get(const char* url, uint8_t** buf, size_t* len, uint8_t* b_int) {
+int remote_get(const char* url, uint8_t** buf, size_t* len,
+               uint8_t* brightness_pct, uint8_t* dwell_secs,
+               uint8_t* palette_mode) {
   // State for processing the response
   struct remote_state state = {
       .buf = malloc(HTTP_BUFFER_SIZE_DEFAULT),
@@ -189,7 +183,10 @@ int remote_get(const char* url, uint8_t** buf, size_t* len, uint8_t* b_int) {
   // Write back the results.
   *buf = state.buf;
   *len = state.len;
-  *b_int = (uint8_t)((state.brightness * 100));  // Scale 0–5 to 0–50
+  // Assumes API provides 0–100 as spec'd, but clamp it just in case
+  *brightness_pct = MIN(state.brightness, 100);
+  *dwell_secs = state.dwell_secs;
+  *palette_mode = state.palette_mode;
 
   esp_http_client_cleanup(http);
 

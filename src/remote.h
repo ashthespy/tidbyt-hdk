@@ -7,4 +7,5 @@
 // Retrieves url via HTTP GET. Caller is responsible for freeing buf
 // on success.
 int remote_get(const char* url, uint8_t** buf, size_t* len,
-               uint8_t* brightness);
+               uint8_t* brightness_pct, uint8_t* dwell_secs,
+               uint8_t* palette_mode);

@@ -172,20 +172,35 @@ void app_main(void) {
   xTaskCreate(button_task, "button_task", 2048, NULL, 5, NULL);
 #endif
   for (;;) {
-    uint8_t* webp;
-    size_t len;
-    static uint8_t brightness = DISPLAY_DEFAULT_BRIGHTNESS;
-    if (remote_get(TIDBYT_REMOTE_URL, &webp, &len, &brightness)) {
-      ESP_LOGE(TAG, "Failed to get webp");
-    } else {
-      display_set_brightness(brightness);
-      if (len) {
-        ESP_LOGI(TAG, "Updated webp (%d bytes)", len);
-        gfx_update(webp, len);
-        free(webp);
-      }
+    if (ota_in_progress()) {
+      ESP_LOGW(TAG, "OTA in progress — skipping remote fetch");
+      vTaskDelay(pdMS_TO_TICKS(5000));
+      continue;
     }
+    uint8_t* webp = NULL;
+    size_t len = 0;
+    static uint8_t brightness = DISPLAY_DEFAULT_BRIGHTNESS;
+    uint8_t dwell_secs = 1;
+    uint8_t palette_mode = 0;
 
-    vTaskDelay(pdMS_TO_TICKS(10000));
+    if (remote_get(TIDBYT_REMOTE_URL, &webp, &len, &brightness, &dwell_secs,
+                   &palette_mode) == 0) {
+      display_set_brightness(brightness);
+      if (webp && len && brightness) {
+        ESP_LOGI(TAG, "Updated webp (%d bytes)", len);
+        gfx_update(webp, len, dwell_secs, palette_mode);
+      } else {
+        ESP_LOGI(TAG, "Skipping draw of webp (%d bytes) brightness: %d", len,
+                 brightness);
+      }
+
+      free(webp);  // caller must free
+    } else {
+      ESP_LOGE(TAG, "Failed to fetch WebP from remote.");
+      dwell_secs = MIN_FETCH_INTERVAL;  // Retry again
+    }
+    uint32_t sleep_ms = MAX(dwell_secs, MIN_FETCH_INTERVAL) * 1000;
+    ESP_LOGI(TAG, "waiting %lu ms before next fetch", sleep_ms);
+    vTaskDelay(pdMS_TO_TICKS(sleep_ms));
   }
 }
