@@ -130,9 +130,13 @@ void app_main(void) {
   }
   esp_register_shutdown_handler(&wifi_shutdown);
 
-  if (start_ota_server()) {
+  if (ota_server_init()) {
     ESP_LOGE(TAG, "failed to initialize OTA");
   }
+
+  // Spawn an OTA task, we don't do much with the handle at this stage
+  xTaskCreate(ota_server_task, "OTA", 8 * 1024, NULL, tskIDLE_PRIORITY + 2,
+              NULL);
 
   // Setup audio.
   if (audio_initialize() != ESP_OK) {
