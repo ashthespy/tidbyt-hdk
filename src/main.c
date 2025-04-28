@@ -35,28 +35,33 @@ void process_buttons() {
   //     vTaskDelay(pdMS_TO_TICKS(200)); // Debounce delay
   // }
 
-  // Increase brightness using PIN_BUTTON_2 (active low)
+  // Increase brightness
   if (gpio_get_level(PIN_BUTTON_2) == 0) {
-    uint8_t currentBrightness = get_brightness();
-    if (currentBrightness <= 245)
-      currentBrightness += 10;
+    uint8_t _brightness_pct = get_brightness();
+    if (_brightness_pct < 100)
+      _brightness_pct += 5;
     else
-      currentBrightness = 255;
-    display_set_brightness(currentBrightness);
-    ESP_LOGI(TAG, "Brightness increased to %d", currentBrightness);
-    vTaskDelay(pdMS_TO_TICKS(200));
+      _brightness_pct = 100;
+
+    display_set_brightness(_brightness_pct);
+    vTaskDelay(pdMS_TO_TICKS(200));  // debounce
   }
 
-  // Decrease brightness using PIN_BUTTON_3 (active low)
+  // Decrease brightness
   if (gpio_get_level(PIN_BUTTON_3) == 0) {
-    uint8_t currentBrightness = get_brightness();
-    if (currentBrightness >= 10)
-      currentBrightness -= 10;
+    uint8_t _brightness_pct = get_brightness();
+    if (_brightness_pct >= 5)
+      _brightness_pct -= 5;
     else
-      currentBrightness = 0;
-    display_set_brightness(currentBrightness);
-    ESP_LOGI(TAG, "Brightness decreased to %d", currentBrightness);
-    vTaskDelay(pdMS_TO_TICKS(200));
+      _brightness_pct = 0;
+
+    display_set_brightness(_brightness_pct);
+    vTaskDelay(pdMS_TO_TICKS(200));  // debounce
+  }
+
+  if (gpio_get_level(PIN_BUTTON_4) == 0) {
+    cycle_display_palette();
+    vTaskDelay(pdMS_TO_TICKS(200));  // Debounce delay
   }
 }
 
