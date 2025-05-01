@@ -2,6 +2,8 @@
 
 #include <cJSON.h>
 
+#include "esp_err.h"
+#include "esp_http_client.h"
 #include "esp_http_server.h"
 #include "esp_https_ota.h"
 #include "esp_log.h"
@@ -15,6 +17,9 @@ static const char *TAG = "OTA_SERVER";
 /* Event‐group and queue */
 static EventGroupHandle_t s_ota_events;
 static QueueHandle_t s_ota_queue;
+static volatile uint8_t s_ota_percent = 0;
+static int s_ota_total_bytes = 0;
+static int s_ota_bytes_read = 0;
 
 /* Structure to hold one OTA request */
 typedef struct {
@@ -30,11 +35,55 @@ EventGroupHandle_t ota_event_group(void) {
       ESP_LOGE(TAG, "Failed to create event group");
       return NULL;
     }
-    xEventGroupClearBits(
-        s_ota_events, OTA_IN_PROGRESS_BIT | OTA_SUCCESS_BIT | OTA_FAILED_BIT);
+    // start with all bits clear
+    xEventGroupClearBits(s_ota_events, OTA_QUEUED_BIT | OTA_IN_PROGRESS_BIT |
+                                           OTA_SUCCESS_BIT | OTA_FAILED_BIT |
+                                           OTA_PROGRESS_UPDATED_BIT);
     ESP_LOGI(TAG, "OTA event group created");
   }
   return s_ota_events;
+}
+
+QueueHandle_t ota_request_queue(void) {
+  if (!s_ota_queue) {
+    s_ota_queue = xQueueCreate(2, sizeof(ota_request_t));
+    if (!s_ota_queue) {
+      ESP_LOGE(TAG, "Failed to create OTA request queue");
+    }
+  }
+  return s_ota_queue;
+}
+
+// HTTP client event handler: updates s_ota_percent on each data chunk
+static esp_err_t ota_http_event_handler(esp_http_client_event_t *evt) {
+  switch (evt->event_id) {
+    case HTTP_EVENT_ON_HEADER:
+      if (evt->header_key &&
+          strcasecmp(evt->header_key, "Content-Length") == 0) {
+        s_ota_total_bytes = atoi(evt->header_value);
+        ESP_LOGI(TAG, "OTA image size: %d bytes", s_ota_total_bytes);
+        s_ota_bytes_read = 0;
+        s_ota_percent = 0;
+      }
+      break;
+    case HTTP_EVENT_ON_DATA:
+      if (s_ota_total_bytes > 0) {
+        s_ota_bytes_read += evt->data_len;
+        int pct = (s_ota_bytes_read * 100) / s_ota_total_bytes;
+        if (pct > 100)
+          pct = 100;
+        else if (pct < 0)
+          pct = 0;
+        if (pct != s_ota_percent) {
+          s_ota_percent = pct;
+          xEventGroupSetBits(s_ota_events, OTA_PROGRESS_UPDATED_BIT);
+        }
+      }
+      break;
+    default:
+      break;
+  }
+  return ESP_OK;
 }
 
 bool ota_in_progress(void) {
@@ -43,40 +92,71 @@ bool ota_in_progress(void) {
   return xEventGroupGetBits(group) & OTA_IN_PROGRESS_BIT;
 }
 
+uint8_t ota_get_progress(void) { return s_ota_percent; }
+
+esp_err_t ota_status_handler(httpd_req_t *req) {
+  EventBits_t bits = xEventGroupGetBits(s_ota_events);
+  const char *status;
+  uint8_t progress = ota_get_progress();
+
+  if (bits & OTA_QUEUED_BIT) {
+    status = "OTA_QUEUED";
+  } else if (bits & OTA_IN_PROGRESS_BIT) {
+    status = "OTA_INPROGRESS";
+  } else if (bits & OTA_SUCCESS_BIT) {
+    status = "OTA_SUCCESS";
+  } else if (bits & OTA_FAILED_BIT) {
+    status = "OTA_FAILED";
+  } else {
+    status = "IDLE";
+  }
+
+  char buf[64];
+  int len = snprintf(buf, sizeof(buf), "{\"status\":\"%s\",\"progress\":%u}",
+                     status, progress);
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, buf, len);
+  return ESP_OK;
+}
+
 esp_err_t ota_server_init(void) {
-  /* 1) Create event‐group */
-  if (ota_event_group() == NULL) {
+  // Init event group and Queue to notify our OTA server to pull something
+  if (!ota_event_group() || !ota_request_queue()) {
     return ESP_ERR_NO_MEM;
   }
 
-  /* 2) Create queue for incoming OTA requests */
-  if (s_ota_queue == NULL) {
-    s_ota_queue = xQueueCreate(2, sizeof(ota_request_t));
-    if (!s_ota_queue) {
-      ESP_LOGE(TAG, "Failed to create OTA queue");
-      return ESP_ERR_NO_MEM;
-    }
-  }
-
-  /* 3) Start HTTPD */
+  // Our PUll and Status handlers
   httpd_handle_t server = NULL;
-  httpd_config_t config =
-      HTTPD_DEFAULT_CONFIG();  // default config
-                               // :contentReference[oaicite:2]{index=2}
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();  // default config
   esp_err_t err = httpd_start(&server, &config);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(err));
     return err;
   }
 
-  /* 4) Register POST /ota handler */
+  // Register POST /ota handler
   httpd_uri_t ota_uri = {.uri = "/ota",
                          .method = HTTP_POST,
                          .handler = ota_pull_handler,
                          .user_ctx = NULL};
   err = httpd_register_uri_handler(server, &ota_uri);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "register uri handler failed: %s", esp_err_to_name(err));
+    ESP_LOGE(TAG, "Pull: /ota handler failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  // Register a simpler /ota/status handler to relay bits
+  httpd_uri_t ota_status_uri = {
+      .uri = "/ota/status",
+      .method = HTTP_GET,
+      .handler = ota_status_handler,
+      .user_ctx = NULL,
+  };
+  err = httpd_register_uri_handler(server, &ota_status_uri);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Status: /ota/status handler failed: %s",
+             esp_err_to_name(err));
     return err;
   }
 
@@ -85,7 +165,7 @@ esp_err_t ota_server_init(void) {
 }
 
 esp_err_t ota_pull_handler(httpd_req_t *req) {
-  xEventGroupSetBits(s_ota_events, OTA_READY);
+  xEventGroupSetBits(s_ota_events, OTA_QUEUED_BIT);
   // Read the full POST body
   int len = req->content_len;
   if (len <= 0 || len >= 512) {
@@ -135,39 +215,8 @@ esp_err_t ota_pull_handler(httpd_req_t *req) {
 
   /* Signal OTA in progress */
   xEventGroupSetBits(s_ota_events, OTA_IN_PROGRESS_BIT);
-  int attempts = 400;  // 400 x 500ms = 200s
-  while (attempts-- > 0) {
-    EventBits_t result = xEventGroupGetBits(s_ota_events);
-    if (result & OTA_SUCCESS_BIT) {
-      httpd_resp_sendstr(req, "OTA success");
-      return ESP_OK;
-    } else if (result & OTA_FAILED_BIT) {
-      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA failed");
-      return ESP_FAIL;
-    }
-    vTaskDelay(pdMS_TO_TICKS(500));
-  }
-  httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "OTA timeout");
-  return ESP_FAIL;
-
-  /* Signal OTA in progress */
-  //   xEventGroupSetBits(s_ota_events, OTA_IN_PROGRESS_BIT);
-  //   EventBits_t result =
-  //       xEventGroupWaitBits(s_ota_events, OTA_SUCCESS_BIT | OTA_FAILED_BIT,
-  //                           pdTRUE,               // clear on exit
-  //                           pdFALSE,              // wait for any
-  //                           pdMS_TO_TICKS(100000)  // timeout
-  //       );
-
-  //   if (result & OTA_SUCCESS_BIT) {
-  //     httpd_resp_sendstr(req, "OTA success");
-  //   } else if (result & OTA_FAILED_BIT) {
-  //     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA
-  //     failed");
-  //   } else {
-  //     httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "OTA timeout");
-  //   }
-  //   return ESP_OK;
+  httpd_resp_sendstr(req, "OTA_QUEUED");
+  return ESP_OK;
 }
 
 static void reboot(void) {
@@ -180,37 +229,53 @@ static void reboot(void) {
 
 void ota_server_task(void *pvParameter) {
   ota_request_t req;
-  while (1) {
-    /* Wait for a queued OTA request */
-    if (xQueueReceive(s_ota_queue, &req, portMAX_DELAY) == pdTRUE) {
-      ESP_LOGI(TAG, "Starting OTA from %s (MD5=%s)", req.url, req.md5);
-      esp_http_client_config_t http_cfg = {
-          .url = req.url,
-          .timeout_ms = 120000,
-          .transport_type = HTTP_TRANSPORT_OVER_TCP,
-          .buffer_size = 16 * 1024,
-      };
-      esp_https_ota_config_t ota_cfg = {
-          .http_config = &http_cfg,
-      };
+  esp_err_t err;
+  while (xQueueReceive(ota_request_queue(), &req, portMAX_DELAY) == pdTRUE) {
+    ESP_LOGI(TAG, "OTA begin: %s", req.url);
 
-      int64_t t0 = esp_timer_get_time();
-      esp_err_t err = esp_https_ota(&ota_cfg);
-      int64_t t1 = esp_timer_get_time();
-      ESP_LOGI(TAG, "OTA took %.2f s", (t1 - t0) / 1e6);
+    // clear QUEUED, set IN_PROGRESS
+    xEventGroupClearBits(s_ota_events,
+                         OTA_QUEUED_BIT | OTA_SUCCESS_BIT | OTA_FAILED_BIT);
+    xEventGroupSetBits(s_ota_events, OTA_IN_PROGRESS_BIT);
 
-      /* Clear IN_PROGRESS bit */
-      xEventGroupClearBits(s_ota_events, OTA_IN_PROGRESS_BIT);
+    // configure OTA
+    esp_http_client_config_t http_cfg = {
+        .url = req.url,
+        .timeout_ms = 120000,
+        .event_handler = ota_http_event_handler,
+    };
+    esp_https_ota_config_t ota_cfg = {
+        .http_config = &http_cfg,
+    };
 
-      if (err == ESP_OK) {
-        ESP_LOGI(TAG, "OTA successful, rebooting");
-        xEventGroupSetBits(s_ota_events, OTA_SUCCESS_BIT);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        esp_restart();
-      } else {
-        ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
-        xEventGroupSetBits(s_ota_events, OTA_FAILED_BIT);
-      }
+    esp_https_ota_handle_t handle = NULL;
+    if (esp_https_ota_begin(&ota_cfg, &handle) != ESP_OK) {
+      ESP_LOGE(TAG, "ota_begin failed");
+      xEventGroupSetBits(s_ota_events, OTA_FAILED_BIT);
+      continue;
+    }
+
+    // Track our OTA chunks until otherwise
+    do {
+      err = esp_https_ota_perform(handle);
+      // yield to other tasks so event callback can run
+      vTaskDelay(pdMS_TO_TICKS(100));
+    } while (err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
+
+    // final cleanup
+    xEventGroupClearBits(s_ota_events, OTA_IN_PROGRESS_BIT);
+    err = esp_https_ota_finish(handle);
+    if (err == ESP_OK) {
+      ESP_LOGI(TAG, "OTA success, rebooting");
+      xEventGroupSetBits(s_ota_events, OTA_SUCCESS_BIT);
+      // signal we done
+      s_ota_percent = 100;
+      xEventGroupSetBits(s_ota_events, OTA_PROGRESS_UPDATED_BIT);
+      vTaskDelay(pdMS_TO_TICKS(750));
+      reboot();
+    } else {
+      ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(err));
+      xEventGroupSetBits(s_ota_events, OTA_FAILED_BIT);
     }
   }
 }

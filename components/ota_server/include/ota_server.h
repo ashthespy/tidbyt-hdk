@@ -7,10 +7,12 @@
 #include "freertos/queue.h"
 
 /* bits for the OTA event‐group */
-#define OTA_READY (1 << 0)
+#define OTA_QUEUED_BIT (1 << 0)
 #define OTA_IN_PROGRESS_BIT (1 << 1)
 #define OTA_SUCCESS_BIT (1 << 2)
 #define OTA_FAILED_BIT (1 << 3)
+// progress‐checkpoint bits:
+#define OTA_PROGRESS_UPDATED_BIT (1 << 4)
 
 /* maximum lengths for URL and MD5 */
 #define OTA_URL_MAX_LEN 256
@@ -46,5 +48,10 @@ void ota_server_task(void *pvParameter);
  * @brief  Check if an OTA is currently in progress
  */
 bool ota_in_progress(void);
+
+/**
+ * @brief  Return current OTA progress (0–100)
+ */
+uint8_t ota_get_progress(void);
 
 #endif  // OTA_SERVER_H
