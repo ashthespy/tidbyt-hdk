@@ -115,6 +115,12 @@ static esp_err_t _httpCallback(esp_http_client_event_t* event) {
       if (state->buf == NULL || state->err != ESP_OK) {
         break;
       }
+      if (state->len + event->data_len > state->size) {
+        ESP_LOGE(TAG, "Buffer overflow detected! len=%zu event_len=%d size=%zu",
+                 state->len, event->data_len, state->size);
+        state->err = ESP_ERR_NO_MEM;
+        return state->err;
+      }
       memcpy((uint8_t*)state->buf + state->len, event->data, event->data_len);
       state->len += event->data_len;
       break;

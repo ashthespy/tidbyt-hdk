@@ -1,14 +1,59 @@
 #!/usr/bin/env python3
-import sys
 import os
-import hashlib
+import sys
 import socket
-import threading
-import http.server
-import socketserver
+import hashlib
+import time
+import signal
 import requests
+import threading
+import json
 
-# ——— MD5 helper ———
+from tqdm import tqdm
+
+from http.server import SimpleHTTPRequestHandler
+from socketserver import ThreadingMixIn, TCPServer
+
+
+# ——— HTTP server that serves our .bin and logs progress ⌛s
+class ThreadedTCPServer(ThreadingMixIn, TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+class OTARequestHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # suppress default logging
+        pass
+
+    def copyfile(self, source, outputfile):
+        """Stream the file to the client, with a tqdm progress bar."""
+        filesize = os.fstat(source.fileno()).st_size
+        with tqdm(
+            total=filesize,
+            unit="B",
+            unit_scale=True,
+            desc="[Server] Uploading",
+            ncols=60,
+            leave=True,
+        ) as bar:
+            while True:
+                chunk = source.read(64 * 1024)
+                if not chunk:
+                    break
+                outputfile.write(chunk)
+                bar.update(len(chunk))
+
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
 def calc_md5(path, chunk_size=8192):
     md5 = hashlib.md5()
     with open(path, "rb") as f:
@@ -16,73 +61,121 @@ def calc_md5(path, chunk_size=8192):
             md5.update(chunk)
     return md5.hexdigest()
 
-# ——— get local LAN IP ———
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        # doesn't actually send packets
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    finally:
-        s.close()
 
-# ——— tiny HTTP server in a background thread ———
-class _SilentHandler(http.server.SimpleHTTPRequestHandler):
-    # suppress console logging
-    def log_message(self, format, *args):
-        pass
+# ——— read version from version.txt ———
+def get_version(version_file):
+    try:
+        with open(version_file, "r") as vf:
+            version = vf.read().strip()
+    except Exception as e:
+        print(
+            f"Warning: could not read version from {version_file}: {e}", file=sys.stderr
+        )
+        version = "0.0.0"
+    return version
+
+
+def poll_ota_status(esp_addr, timeout=300):
+    url = f"http://{esp_addr}/ota/status"
+    deadline = time.time() + timeout
+    last_status = None
+    last_progress = -1
+
+    while time.time() < deadline:
+        try:
+            r = requests.get(url, timeout=5)
+            r.raise_for_status()
+            data = r.json()
+
+            status = data.get("status", "UNKNOWN").upper()
+            progress = data.get("progress", 0)
+
+            if status != last_status or progress != last_progress:
+                print(f"📶 OTA status: {status} ({progress}%)", flush=True)
+                last_status = status
+                last_progress = progress
+
+            if status in ("OTA_SUCCESS", "SUCCESS", "IDLE"):
+                print("✅ OTA completed successfully!", flush=True)
+                return 0
+            if status in ("OTA_FAILED", "FAILED"):
+                print("❌ OTA failed.", flush=True)
+                return 1
+
+        except requests.RequestException as e:
+            print(f"⚠️  Polling error: {e}", flush=True)
+        except json.JSONDecodeError as e:
+            print(f"⚠️  JSON decode error: {e}", flush=True)
+
+        time.sleep(10)
+
+    print("⏳ OTA status polling timed out.", flush=True)
+    return 1
 
 def start_http_server(directory):
-    # serve 'directory' on an ephemeral port
     os.chdir(directory)
-    httpd = socketserver.TCPServer(("", 0), _SilentHandler)
-    port = httpd.server_address[1]
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server = ThreadedTCPServer(("", 0), OTARequestHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    return httpd, port
+    return server, port
 
-# ——— OTA upload logic ———
-def ota_upload(fw_path, esp_addr):
-    fw_dir  = os.path.dirname(fw_path) or "."
-    fw_file = os.path.basename(fw_path)
 
-    # 1) MD5
+def main():
+    # catch Ctrl-C
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(1))
+
+    if len(sys.argv) != 3:
+        print(f"Usage: {sys.argv[0]} <firmware.bin> <esp-ip[:port]>", file=sys.stderr)
+        sys.exit(1)
+
+    fw_path, esp_addr = sys.argv[1], sys.argv[2]
+    if not os.path.isfile(fw_path):
+        print(f"Error: firmware file '{fw_path}' not found.", file=sys.stderr)
+        sys.exit(1)
+
+    # compute MD5 and prepare URL
     md5sum = calc_md5(fw_path)
+    fw_dir = os.path.dirname(fw_path) or "."
+    fw_file = os.path.basename(fw_path)
+    version = get_version(os.path.join(os.getcwd(), "version.txt"))
 
-    # 2) HTTP server
-    httpd, host_port = start_http_server(fw_dir)
-
-    # 3) discover IP
-    host_ip = get_local_ip()
-
-    # 4) build invite URL
-    #    your esp_http_server GET handler expects these four params:
-    #      MD5, host, port, path
-    invite = (
-        f"http://{esp_addr}/"
-        f"?MD5={md5sum}"
-        f"&host={host_ip}"
-        f"&port={host_port}"
-        f"&path=/{fw_file}"
-    )
-    print(f"→ OTA Invite: GET {invite}", flush=True)
-
-    # 5) fire the GET and wait for the ESP’s response
+    server = None
+    exit_code = 1
     try:
-        r = requests.get(invite, timeout=600)   # give it up to 10 minutes
-        print(f"← HTTP {r.status_code}", flush=True)
-        print(r.text.strip(), flush=True)
-        code = 0 if r.status_code == 200 else 1
-    except requests.exceptions.RequestException as e:
-        print(f"Error: OTA invite failed: {e}", flush=True)
-        code = 1
+        # Start file‐server
+        server, port = start_http_server(fw_dir)
+        host_ip = get_local_ip()
 
-    # 6) clean up
-    httpd.shutdown()
-    sys.exit(code)
+        # Invite ESP to pull it
+        ota_body = {
+            "MD5": md5sum,
+            "url": f"http://{host_ip}:{port}/{fw_file}",
+            "version": version,
+        }
+        ota_url = f"http://{esp_addr}/ota"
+        print(f"→ OTA Invite: POST {ota_url} with body {ota_body}", flush=True)
+
+        try:
+            r = requests.post(ota_url, json=ota_body, timeout=600)
+            print(f"\n← HTTP {r.status_code}", flush=True)
+            print(r.text.strip(), flush=True)
+            if r.status_code != 200:
+                return 1
+        except requests.RequestException as e:
+            print(f"\nError: OTA request failed: {e}", file=sys.stderr, flush=True)
+            return 1
+
+        # Poll for final status
+        exit_code = poll_ota_status(esp_addr)
+
+    finally:
+        if server:
+            print("Shutting down HTTP server...", flush=True)
+            server.shutdown()
+
+    sys.exit(exit_code)
+
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: ota_upload.py <firmware.bin> <esp-ip[:port]>", file=sys.stderr)
-        sys.exit(1)
-    ota_upload(sys.argv[1], sys.argv[2])
+    main()

@@ -1,7 +1,7 @@
 #include "time_sync.h"
 
 #include <stdbool.h>
-#include <time.h>>
+#include <time.h>
 
 #include "esp_log.h"
 #include "esp_sntp.h"
@@ -10,16 +10,6 @@
 
 static const char *TAG = "NTP";
 static TaskHandle_t time_task_handle = NULL;
-
-void time_start_sync_task(const char *timezone_str) {
-  if (time_task_handle == NULL) {
-    ESP_LOGI(TAG, "Starting time sync task...");
-    xTaskCreate(time_sync_task, "time_sync_task", 4096, (void *)timezone_str, 5,
-                &time_task_handle);
-  } else {
-    ESP_LOGW(TAG, "Time sync task already running");
-  }
-}
 
 static void time_sync_task(void *param) {
   const char *timezone_str = (const char *)param;
@@ -40,6 +30,16 @@ static void time_sync_task(void *param) {
   }
 
   vTaskDelete(NULL);
+}
+
+void time_start_sync_task(const char *timezone_str) {
+  if (time_task_handle == NULL) {
+    ESP_LOGI(TAG, "Starting time sync task...");
+    xTaskCreate(time_sync_task, "time_sync_task", 4096, (void *)timezone_str, 5,
+                &time_task_handle);
+  } else {
+    ESP_LOGW(TAG, "Time sync task already running");
+  }
 }
 
 static void time_sync_notification_cb(struct timeval *tv) {

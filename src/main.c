@@ -25,12 +25,13 @@ static const char* TAG = "main";
 
 #ifndef DEFAULT_TIMEZONE
 DEFAULT_TIMEZONE = "America/New_York"
-#ifdef
+#endif
 
 #ifdef TIXEL
-// Polls button states and calls functions for display toggle and brightness
-// adjustment
-void process_buttons() {
+    // Polls button states and calls functions for display toggle and brightness
+    // adjustment
+    void
+    process_buttons() {
   // Toggle display with PIN_BUTTON_1 (active low)
   if (gpio_get_level(PIN_BUTTON_1) == 0) {
     toggle_display_night_mode();
@@ -105,7 +106,7 @@ void button_task(void* pvParameter) {
 #endif
 void _on_touch() {
   ESP_LOGI(TAG, "Touch detected");
-  audio_play(ASSET_LAZY_DADDY_MP3, ASSET_LAZY_DADDY_MP3_LEN);
+  // audio_play(ASSET_LAZY_DADDY_MP3, ASSET_LAZY_DADDY_MP3_LEN);
 }
 
 void app_main(void) {
@@ -166,41 +167,80 @@ void app_main(void) {
   time_start_sync_task(DEFAULT_TIMEZONE);
 
   // Play a sample. This will only have an effect on Gen 2 devices.
-  audio_play(ASSET_LAZY_DADDY_MP3, ASSET_LAZY_DADDY_MP3_LEN);
+  // audio_play(ASSET_LAZY_DADDY_MP3, ASSET_LAZY_DADDY_MP3_LEN);
 #ifdef TIXEL
   // Create a separate task for handling button inputs
   xTaskCreate(button_task, "button_task", 2048, NULL, 5, NULL);
 #endif
+  TickType_t nextDelay = 0;
   for (;;) {
-    if (ota_in_progress()) {
-      ESP_LOGW(TAG, "OTA in progress — skipping remote fetch");
-      vTaskDelay(pdMS_TO_TICKS(5000));
+    // block until either OTA_IN_PROGRESS_BIT goes high, or our timer expires
+    static uint8_t last_ota_step = 255;
+    EventBits_t ev = xEventGroupWaitBits(ota_event_group(), OTA_IN_PROGRESS_BIT,
+                                         pdFALSE,  // don’t clear the bit
+                                         pdFALSE,  // wait for ANY
+                                         nextDelay);
+
+    // Show OTA screen and keep waiting for it to finish
+    if (ev & OTA_IN_PROGRESS_BIT) {
+      if (ev & OTA_PROGRESS_UPDATED_BIT) {
+        uint8_t p = ota_get_progress();
+
+        uint8_t step = 0;
+        if (p < 25)
+          step = 0;
+        else if (p < 50)
+          step = 25;
+        else if (p < 75)
+          step = 50;
+        else if (p < 100)
+          step = 75;
+        else
+          step = 100;
+
+        if (step != last_ota_step) {
+          last_ota_step = step;
+          gfx_show_ota(step);
+        }
+      }
+      // when OTA finishes it will clear that bit; and reboot..
+      // but incase, fall through to fetch so nextDelay alone
+      vTaskDelay(pdMS_TO_TICKS(250));  // feed the dog
       continue;
     }
-    uint8_t* webp = NULL;
-    size_t len = 0;
-    static uint8_t brightness = DISPLAY_DEFAULT_BRIGHTNESS;
-    uint8_t dwell_secs = 1;
-    uint8_t palette_mode = 0;
 
-    if (remote_get(TIDBYT_REMOTE_URL, &webp, &len, &brightness, &dwell_secs,
-                   &palette_mode) == 0) {
-      display_set_brightness(brightness);
-      if (webp && len && brightness) {
-        ESP_LOGI(TAG, "Updated webp (%d bytes)", len);
-        gfx_update(webp, len, dwell_secs, palette_mode);
+    // timer expiry: remote fetch -> update buffer dance
+    {
+      uint8_t* webp = NULL;
+      size_t len = 0;
+      uint8_t dwell_secs = MIN_FETCH_INTERVAL;
+      static uint8_t brightness = DISPLAY_DEFAULT_BRIGHTNESS;
+      uint8_t palette = 0;
+
+      if (remote_get(TIDBYT_REMOTE_URL, &webp, &len, &brightness, &dwell_secs,
+                     &palette) == 0) {
+        display_set_brightness(brightness);
+        if (webp && len && brightness) {
+          webp_meta_t meta = {
+              .dwell_secs = dwell_secs,
+              .palette_mode = palette,
+          };
+          ESP_LOGI(TAG, "Updated webp (%zu bytes)", len);
+          gfx_update(webp, len, &meta);
+        } else {
+          ESP_LOGI(TAG, "Skipping draw of webp (%zu bytes) brightness: %d", len,
+                   brightness);
+        }
+        free(webp);
       } else {
-        ESP_LOGI(TAG, "Skipping draw of webp (%d bytes) brightness: %d", len,
-                 brightness);
+        ESP_LOGE(TAG, "Failed to fetch WebP");
+        dwell_secs = MIN_FETCH_INTERVAL;
       }
 
-      free(webp);  // caller must free
-    } else {
-      ESP_LOGE(TAG, "Failed to fetch WebP from remote.");
-      dwell_secs = MIN_FETCH_INTERVAL;  // Retry again
+      // schedule next wakeup: max(dwell, MIN_FETCH_INTERVAL)
+      uint32_t ms = MAX((uint32_t)dwell_secs, MIN_FETCH_INTERVAL) * 1000;
+      nextDelay = pdMS_TO_TICKS(ms);
+      ESP_LOGI(TAG, "Next fetch in %lu ms", ms);
     }
-    uint32_t sleep_ms = MAX(dwell_secs, MIN_FETCH_INTERVAL) * 1000;
-    ESP_LOGI(TAG, "waiting %lu ms before next fetch", sleep_ms);
-    vTaskDelay(pdMS_TO_TICKS(sleep_ms));
   }
 }

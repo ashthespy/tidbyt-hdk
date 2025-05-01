@@ -17,8 +17,6 @@ extern "C" {
  */
 void time_start_sync_task(const char *timezone_str);
 
-static void time_sync_task(void *param);
-
 /**
  * @brief Initialize and synchronize time via NTP.
  *
