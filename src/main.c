@@ -1,5 +1,6 @@
 #include <assets.h>
 #include <esp_log.h>
+#include <esp_netif.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/timers.h>
@@ -132,7 +133,7 @@ void app_main(void) {
   esp_register_shutdown_handler(&display_shutdown);
 
   // Setup WiFi.
-  if (wifi_initialize(TIDBYT_WIFI_SSID, TIDBYT_WIFI_PASSWORD)) {
+  if (wifi_initialize(WIFI_SSID, WIFI_PASSWORD)) {
     ESP_LOGE(TAG, "failed to initialize WiFi");
     return;
   }
@@ -172,6 +173,11 @@ void app_main(void) {
   // Create a separate task for handling button inputs
   xTaskCreate(button_task, "button_task", 2048, NULL, 5, NULL);
 #endif
+
+  const char* hostname;
+  esp_netif_t* default_netif = esp_netif_get_default_netif();
+  esp_netif_get_hostname(default_netif, &hostname);
+  ESP_LOGI(TAG, "Hostname: %s", hostname);
   TickType_t nextDelay = 0;
   for (;;) {
     // block until either OTA_IN_PROGRESS_BIT goes high, or our timer expires
@@ -217,7 +223,7 @@ void app_main(void) {
       static uint8_t brightness = DISPLAY_DEFAULT_BRIGHTNESS;
       uint8_t palette = 0;
 
-      if (remote_get(TIDBYT_REMOTE_URL, &webp, &len, &brightness, &dwell_secs,
+      if (remote_get(REMOTE_URL, &webp, &len, &brightness, &dwell_secs,
                      &palette) == 0) {
         display_set_brightness(brightness);
         if (webp && len && brightness) {

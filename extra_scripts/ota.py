@@ -8,14 +8,12 @@ import signal
 import requests
 import threading
 import json
-
+import click  # already used in pio
 from tqdm import tqdm
-
 from http.server import SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn, TCPServer
 
 
-# ——— HTTP server that serves our .bin and logs progress ⌛s
 class ThreadedTCPServer(ThreadingMixIn, TCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -23,17 +21,15 @@ class ThreadedTCPServer(ThreadingMixIn, TCPServer):
 
 class OTARequestHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
-        # suppress default logging
         pass
 
     def copyfile(self, source, outputfile):
-        """Stream the file to the client, with a tqdm progress bar."""
         filesize = os.fstat(source.fileno()).st_size
         with tqdm(
             total=filesize,
             unit="B",
             unit_scale=True,
-            desc="[Server] Uploading",
+            desc="[OTA]",
             ncols=60,
             leave=True,
         ) as bar:
@@ -62,17 +58,15 @@ def calc_md5(path, chunk_size=8192):
     return md5.hexdigest()
 
 
-# ——— read version from version.txt ———
 def get_version(version_file):
     try:
         with open(version_file, "r") as vf:
-            version = vf.read().strip()
+            return vf.read().strip()
     except Exception as e:
-        print(
-            f"Warning: could not read version from {version_file}: {e}", file=sys.stderr
+        click.secho(
+            f"Warning: could not read version from {version_file}: {e}", fg="yellow"
         )
-        version = "0.0.0"
-    return version
+        return "0.0.0"
 
 
 def poll_ota_status(esp_addr, timeout=300):
@@ -91,26 +85,27 @@ def poll_ota_status(esp_addr, timeout=300):
             progress = data.get("progress", 0)
 
             if status != last_status or progress != last_progress:
-                print(f"📶 OTA status: {status} ({progress}%)", flush=True)
+                # print(f"📶 OTA status: {status} ({progress}%)", flush=True)
                 last_status = status
                 last_progress = progress
 
             if status in ("OTA_SUCCESS", "SUCCESS", "IDLE"):
-                print("✅ OTA completed successfully!", flush=True)
+                click.secho("OTA completed successfully.", fg="green", bold=True)
                 return 0
             if status in ("OTA_FAILED", "FAILED"):
-                print("❌ OTA failed.", flush=True)
+                click.secho("OTA failed.", fg="red", bold=True)
                 return 1
 
         except requests.RequestException as e:
-            print(f"⚠️  Polling error: {e}", flush=True)
+            tqdm.write(f"{' ' * 75}| Error: {e}")
         except json.JSONDecodeError as e:
-            print(f"⚠️  JSON decode error: {e}", flush=True)
+            tqdm.write(f"{' ' * 75}| JSON decode error: {e}")
 
-        time.sleep(10)
+        time.sleep(5)
 
-    print("⏳ OTA status polling timed out.", flush=True)
+    click.secho("OTA status polling timed out.", fg="red")
     return 1
+
 
 def start_http_server(directory):
     os.chdir(directory)
@@ -121,57 +116,54 @@ def start_http_server(directory):
     return server, port
 
 
-def main():
-    # catch Ctrl-C
+@click.command()
+@click.argument("firmware_path")
+@click.argument("esp_address")
+def main(firmware_path, esp_address):
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(1))
 
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <firmware.bin> <esp-ip[:port]>", file=sys.stderr)
+    if not os.path.isfile(firmware_path):
+        click.secho(
+            f"Error: firmware file '{firmware_path}' not found.", fg="red", bold=True
+        )
         sys.exit(1)
 
-    fw_path, esp_addr = sys.argv[1], sys.argv[2]
-    if not os.path.isfile(fw_path):
-        print(f"Error: firmware file '{fw_path}' not found.", file=sys.stderr)
-        sys.exit(1)
-
-    # compute MD5 and prepare URL
-    md5sum = calc_md5(fw_path)
-    fw_dir = os.path.dirname(fw_path) or "."
-    fw_file = os.path.basename(fw_path)
+    md5sum = calc_md5(firmware_path)
+    fw_dir = os.path.dirname(firmware_path) or "."
+    fw_file = os.path.basename(firmware_path)
     version = get_version(os.path.join(os.getcwd(), "version.txt"))
 
     server = None
     exit_code = 1
     try:
-        # Start file‐server
         server, port = start_http_server(fw_dir)
         host_ip = get_local_ip()
 
-        # Invite ESP to pull it
         ota_body = {
             "MD5": md5sum,
             "url": f"http://{host_ip}:{port}/{fw_file}",
             "version": version,
         }
-        ota_url = f"http://{esp_addr}/ota"
-        print(f"→ OTA Invite: POST {ota_url} with body {ota_body}", flush=True)
+        ota_url = f"http://{esp_address}/ota"
+
+        click.secho(f"→ OTA Invite: POST {ota_url}", fg="blue", bold=True)
+        click.secho(f"   Body: {json.dumps(ota_body)}", fg="white")
 
         try:
             r = requests.post(ota_url, json=ota_body, timeout=600)
-            print(f"\n← HTTP {r.status_code}", flush=True)
-            print(r.text.strip(), flush=True)
+            click.secho(f"\n← HTTP {r.status_code}", fg="magenta")
+            click.secho(r.text.strip(), fg="magenta")
             if r.status_code != 200:
                 return 1
         except requests.RequestException as e:
-            print(f"\nError: OTA request failed: {e}", file=sys.stderr, flush=True)
+            click.secho(f"\nOTA request failed: {e}", fg="red", bold=True)
             return 1
 
-        # Poll for final status
-        exit_code = poll_ota_status(esp_addr)
+        exit_code = poll_ota_status(esp_address)
 
     finally:
         if server:
-            print("Shutting down HTTP server...", flush=True)
+            click.secho("Shutting down HTTP server...", fg="white", dim=True)
             server.shutdown()
 
     sys.exit(exit_code)
